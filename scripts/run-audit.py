@@ -46,7 +46,7 @@ def publish(final_code=None):
     if args.publish_config and os.path.exists(args.publish_config):
         try:
             conf=json.load(open(args.publish_config))
-            request=urllib.request.Request(conf['url'],data=snapshot.read_bytes(),headers={'Content-Type':'application/json','Authorization':'Bearer '+conf['token']},method='POST')
+            request=urllib.request.Request(conf['url'],data=snapshot.read_bytes(),headers={'User-Agent':'TavusVolumeAudit/1.0','Content-Type':'application/json','Authorization':'Bearer '+conf['token']},method='POST')
             with urllib.request.urlopen(request,timeout=60) as response:
                 print('Published snapshot:',response.status,flush=True)
         except Exception as exc:print('Publication failed:',type(exc).__name__,flush=True)
