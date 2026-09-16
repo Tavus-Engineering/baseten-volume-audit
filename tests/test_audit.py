@@ -88,6 +88,25 @@ class AuditTests(unittest.TestCase):
         self.run_cli('scan', self.root, '--db', self.db, code=1)
         self.run_cli('scan', self.root, '--db', self.db, '--resume', code=1)
 
+    def test_batched_largest_files_preserves_totals_and_ties(self):
+        expected = []
+        for i in range(96):
+            directory = self.root / str(i)
+            directory.mkdir()
+            for j in range(3):
+                path = directory / str(j)
+                size = (i * 17 + j) % 43
+                path.write_bytes(b'x' * size)
+                expected.append((size, os.fsencode(path.resolve())))
+        self.run_cli('scan', self.root, '--db', self.db, '--top', 5, '--workers', 4)
+        with contextlib.closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT logical,path FROM largest ORDER BY logical DESC,path DESC').fetchall(),
+                             sorted(expected, reverse=True)[:5])
+        result = self.report()
+        self.assertEqual(result['totals']['files'], len(expected))
+        self.assertEqual(result['totals']['logical'], sum(size for size, _ in expected))
+        self.assertEqual(sum(g['files'] for g in result['groups'] if g['kind'] == 'type'), len(expected))
+
     def test_sigkill_resume_staged_children(self):
         for i in range(1100):
             d = self.root / str(i)

@@ -42,6 +42,8 @@ To stop, press Ctrl-C or send SIGTERM. Resume with the same command plus `--resu
 
 Worker count and rate may change on resume. Root identity, cluster label, shard settings, exclusions, `--top`, and accounting options must match. Completed directories are reused; unfinished directories restart from their beginning, including after SIGKILL. A blocked filesystem syscall can delay shutdown. A completed scan is not refreshed by `--resume`; use a new database for a fresh inventory. Errored directories are recorded as finished-with-errors and require a fresh scan after fixing access.
 
+Directory results commit in bounded batches, retaining SQLite's full durability and crash recovery. Up to `max(workers, 32)` directories are queued or running; filesystem concurrency remains limited by `--workers`. Small-file candidates below the established global top-file cutoff skip ranking work, while all accounting totals remain included.
+
 ## Reports and drilldown
 
 ```bash
@@ -143,3 +145,19 @@ The optional publisher file must be private (`chmod 600`), containing `{"url":"h
 `export-snapshot.py` can independently export a live SQLite inventory for the website without locking or stopping the scanner. It streams every directory's committed metrics, computes recursive totals for the published ancestors, and retains at most 12,000 directory records across five levels. Parent totals cover all observed descendants even when published child detail is capped. Timestamps describe snapshot capture time. During active scans totals are partial; snapshots retain that status.
 
 The H100 volume observed during initial deployment uses **WEKA**. Do not assume every Baseten cluster uses JuiceFS. The dashboard source and runtime data are kept separately from this public scripts repository; the ingestion credential and shared viewer password are distinct.
+
+### Approximate inventory
+
+```bash
+python3 volume_audit.py scan /root/.cache/team_artifacts \
+  --approximate --sample-size 100 --cluster h100 --filesystem WEKA \
+  --rate 10000 --output /tmp/h100-estimate.json
+```
+
+This is a separate JSON inventory; it never changes or resumes the exact SQLite scan. Every visited directory is listed once. Up to 100 immediate regular files/subdirectories are then sampled uniformly, stratified between the two kinds. Direct file/directory counts at visited directories come from the full listing; descendant counts and byte totals are extrapolated where children were skipped. Directories with no more than 100 eligible children are fully measured. Root directories are all visited to preserve top-level comparisons (root files are still sampled). `--sample-size` changes the threshold and sample budget; `--seed` changes the random sample. Sampling is single-worker; `--rate` bounds its own entry operations, separately from any concurrent exact scan.
+
+Samples recurse using the same rule. The output records sampled/population counts, estimated flags, and approximate 95% sampling margins with finite-population correction and propagation of nested uncertainty. These margins are not guarantees: rare huge objects can be missed, and zero variation in a sample does not establish identical contents. Insufficient samples and access errors produce unknown margins. Symlinks, special files, and directory allocation blocks are excluded; hard links remain counted by path. Results from a live volume are not a point-in-time snapshot.
+
+`complete` stays false for the approximate inventory; `coverage_complete` means the sampling run finished, not that every file was measured. A partial root only includes completed top-level work. Directory detail is limited to two levels and omits individual sampled children when their siblings were skipped, preventing sampled children from appearing to be an exhaustive ranking. Never use estimates alone to decide what to delete. More samples or the exact scan can verify suspicious/uneven subtrees.
+
+Names can usually be counted without a separate stat call when the filesystem supplies entry types. Filesystems that omit entry types may require metadata requests even during counting. Counting *all descendants* still requires visiting every nested directory; subtree sampling is what avoids that work.

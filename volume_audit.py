@@ -144,7 +144,7 @@ def scan_directory(dbpath, row, config, stop, limiter):
                         if depth == 0 and int.from_bytes(hashlib.sha256(name).digest()[:8], 'big') % config['shards'] != config['shard_index']:
                             continue
                         child = os.path.join(path, name)
-                        relative = os.path.relpath(child, os.fsencode(config['root']))
+                        relative = os.path.relpath(child, os.fsencode(config['root'])) if config['exclude_bytes'] else b''
                         if any(relative == x or relative.startswith(x + b'/') for x in config['exclude_bytes']):
                             counts['excluded'] += 1
                             continue
@@ -178,6 +178,8 @@ def scan_directory(dbpath, row, config, stop, limiter):
                             g[1] += st.st_size
                             g[2] += st.st_blocks * 512
                         item = (st.st_size, child, st.st_blocks * 512, st.st_mtime)
+                        if st.st_size < config.get('minimum_top_size', 0):
+                            continue
                         if len(largest) < config['top']:
                             heapq.heappush(largest, item)
                         elif item > largest[0]:
@@ -193,22 +195,30 @@ def scan_directory(dbpath, row, config, stop, limiter):
         if stop.is_set():
             raise Interrupted()
         flush()
-        with db:
-            db.execute('UPDATE dirs SET state=\'done\',' + ','.join(f'{m}=?' for m in METRICS) + ' WHERE id=?',
+        return (ident, counts, groups, largest, errors)
+    finally:
+        db.close()
+
+
+def commit_results(db, results, config):
+    """Persist a bounded batch atomically; unfinished parents remain replayable."""
+    with db:
+        for ident, counts, groups, largest, errors in results:
+            db.execute("UPDATE dirs SET state='done'," + ','.join(f'{m}=?' for m in METRICS) + ' WHERE id=?',
                        [counts[m] for m in METRICS] + [ident])
             db.executemany('INSERT INTO groups VALUES (?,?,?,?,?) ON CONFLICT(kind,bucket) DO UPDATE SET '
                            'files=files+excluded.files, logical=logical+excluded.logical, allocated=allocated+excluded.allocated',
                            [(kind, bucket, *values) for (kind, bucket), values in groups.items()])
             db.executemany('INSERT OR REPLACE INTO largest VALUES (?,?,?,?)',
-                           [(p, size, allocated, mtime) for size, p, allocated, mtime in largest])
-            db.execute('DELETE FROM largest WHERE path NOT IN '
-                       '(SELECT path FROM largest ORDER BY logical DESC,path DESC LIMIT ?)', (config['top'],))
-            # Keep a bounded sample; counts above always retain the total.
-            remaining = max(0, 10000 - db.execute('SELECT COUNT(*) FROM errors').fetchone()[0])
-            db.executemany('INSERT INTO errors VALUES (?,?)', errors[:remaining])
-        return counts['files']
-    finally:
-        db.close()
+                           [(p, size, allocated, mtime) for size, p, allocated, mtime in largest
+                            if size >= config.get('minimum_top_size', 0)])
+            if errors:
+                remaining = max(0, 10000 - db.execute('SELECT COUNT(*) FROM errors').fetchone()[0])
+                db.executemany('INSERT INTO errors VALUES (?,?)', errors[:remaining])
+        db.execute('DELETE FROM largest WHERE path NOT IN '
+                   '(SELECT path FROM largest ORDER BY logical DESC,path DESC LIMIT ?)', (config['top'],))
+    count, minimum = db.execute('SELECT COUNT(*),MIN(logical) FROM largest').fetchone()
+    config['minimum_top_size'] = minimum if count >= config['top'] else 0
 
 
 @contextlib.contextmanager
@@ -285,26 +295,32 @@ def scan(args):
                             with db:
                                 rows = db.execute("SELECT d.id,d.parent,d.path,d.depth FROM dirs d WHERE d.state='pending' "
                                     "AND (d.parent IS NULL OR EXISTS (SELECT 1 FROM dirs p WHERE p.id=d.parent AND p.state='done')) "
-                                    'ORDER BY d.id LIMIT ?', (args.workers - len(active),)).fetchall()
+                                    'ORDER BY d.id LIMIT ?', (max(args.workers, 32) - len(active),)).fetchall()
                                 db.executemany("UPDATE dirs SET state='active' WHERE id=?", [(r[0],) for r in rows])
                             for row in rows:
                                 active[pool.submit(scan_directory, dbpath, row, config, stop, limiter)] = row[0]
                         if not active:
                             break
-                        done, _ = concurrent.futures.wait(active, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
+                        done, _ = concurrent.futures.wait(active, timeout=0.02, return_when=concurrent.futures.ALL_COMPLETED)
+                        results = []
                         for future in done:
                             active.pop(future)
                             try:
-                                completed_files += future.result()
+                                result = future.result()
+                                results.append(result)
+                                completed_files += result[1]['files']
                             except Interrupted:
                                 pass
                             except Exception as exc:
                                 failed = exc
                                 stop.set()
+                        if results:
+                            commit_results(db, results, config)
                         if time.monotonic() - last >= args.progress:
                             progress = dict(db.execute('SELECT state,COUNT(*) FROM dirs GROUP BY state'))
                             print(json.dumps({'directories': progress, 'files_committed_this_run': completed_files,
-                                              'active_workers': len(active)}), file=sys.stderr, flush=True)
+                                              'active_workers': min(args.workers, len(active)),
+                                              'inflight_directories': len(active)}), file=sys.stderr, flush=True)
                             last = time.monotonic()
             finally:
                 for sig, handler in previous.items():
@@ -416,7 +432,12 @@ def main():
     p.set_defaults(func=preflight)
     p = commands.add_parser('scan', help='Scan metadata; persist resumable results outside the target tree')
     p.add_argument('root')
-    p.add_argument('--db', required=True)
+    p.add_argument('--db')
+    p.add_argument('--approximate', action='store_true', help='Sample up to 100 children per large folder; write a separate JSON estimate')
+    p.add_argument('--sample-size', type=positive, default=100)
+    p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--output', help='Approximate snapshot JSON destination outside scanned root')
+    p.add_argument('--filesystem', default='Unknown')
     p.add_argument('--workers', type=positive, default=2)
     p.add_argument('--cluster', default='', help='Volume/cluster identity, e.g. h200-us-east')
     p.add_argument('--scan-id', default='', help='Shared identifier for one distributed scan')
@@ -440,6 +461,14 @@ def main():
     p.set_defaults(func=report)
     args = parser.parse_args()
     try:
+        if args.command == 'scan':
+            if args.approximate:
+                from approximate_audit import run
+                return run(args)
+            if not args.db:
+                raise ValueError('--db is required for exact scans')
+            if args.output:
+                raise ValueError('--output is only for --approximate')
         return args.func(args)
     except (ValueError, OSError, sqlite3.Error) as exc:
         print(f'error: {exc}', file=sys.stderr)
