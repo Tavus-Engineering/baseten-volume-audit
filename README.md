@@ -121,3 +121,25 @@ python3 -m unittest discover -s tests -v
 ```
 
 CI covers Python 3.9, 3.12, and 3.14 on Linux. Tests cover sparse files, hard links, symlink cycles, special files, unusual filenames, errors, exclusions, process locking, interruption, crash recovery with staged children, sharding, and merge validation. Linux exercises non-UTF-8 filenames; macOS uses Unicode because APFS rejects arbitrary byte names. This repository has not been benchmarked against a 500 TB production volume. Tune using a representative subtree before a full run.
+
+## Baseten jobs and the hosted explorer
+
+`training/audit_h100.py` and `training/audit_h200.py` create one-GPU audit hosts with a two-hour maximum runtime. Launch only the cluster needed, with the team whose cache you intend to inspect:
+
+```bash
+truss train push training/audit_h100.py --team Tavus --non-interactive
+```
+
+Copy this repository into the job's local scratch directory, then run:
+
+```bash
+python3 scripts/run-audit.py --cluster h100 --filesystem WEKA \
+  --directory /tmp/volume-audit --duration 6000 --workers 4 --rate 10000 \
+  --publish-config /tmp/private-publish.json
+```
+
+The optional publisher file must be private (`chmod 600`), containing `{"url":"https://YOUR-SITE/api/ingest","token":"YOUR_INGEST_TOKEN"}`. Never commit it. The job reads it on each update, so it can be added after starting the scan. The wrapper publishes snapshots every 30 seconds plus export time and sends a final snapshot before it exits. It does not stop the Baseten host itself; stop that job after collecting results, or let the host's two-hour bound expire. The scan duration excludes a currently blocked filesystem syscall.
+
+`export-snapshot.py` can independently export a live SQLite inventory for the website without locking or stopping the scanner. It streams every directory's committed metrics, computes recursive totals for the published ancestors, and retains at most 12,000 directory records across five levels. Parent totals cover all observed descendants even when published child detail is capped. Timestamps describe snapshot capture time. During active scans totals are partial; snapshots retain that status.
+
+The H100 volume observed during initial deployment uses **WEKA**. Do not assume every Baseten cluster uses JuiceFS. The dashboard source and runtime data are kept separately from this public scripts repository; the ingestion credential and shared viewer password are distinct.
