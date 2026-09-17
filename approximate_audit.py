@@ -13,6 +13,10 @@ import time
 
 from volume_audit import Limiter, Interrupted
 
+class BudgetExceeded(Exception):
+    pass
+
+
 METRICS = ('files', 'logical', 'allocated', 'directories')
 
 
@@ -51,19 +55,57 @@ class Sampler:
         self.excludes = [os.path.normpath(p) for p in args.exclude]
         self.finished = False
         self.root_result = None
+        self.budget = None
+        self.frames = {}
+        self.last_publish = time.monotonic()
+        self.budget_exhausted = []
 
     def tick(self):
         if self.limiter.wait(self.stop):
             raise Interrupted()
+        if time.monotonic() - self.last_publish >= min(10, self.args.progress):
+            for path, (result, retain) in self.frames.items():
+                if retain: self.record(path, result, True)
+            self.write()
+            self.last_publish = time.monotonic()
+        if self.budget:
+            starts, deadline = self.budget
+            for counter, limit in [('directories_opened', self.args.subtree_directories),
+                                   ('entries_listed', self.args.subtree_entries),
+                                   ('file_stats', self.args.subtree_stats)]:
+                if self.counters[counter] - starts[counter] >= limit:
+                    raise BudgetExceeded(counter)
+            if time.monotonic() >= deadline:
+                raise BudgetExceeded('time')
 
     def error(self, path, exc):
         if len(self.error_samples) < 100:
             self.error_samples.append(dict(path=os.path.relpath(path, self.root), error=str(exc)))
 
-    def walk(self, path, depth=0, retain=True):
-        self.tick()
+    def walk(self, path, depth=0, retain=True, directory_budget=None):
+        if depth == 1:
+            self.budget = (dict(self.counters), time.monotonic() + self.args.subtree_seconds)
+            directory_budget = self.args.subtree_directories
+        try:
+            return self._walk(path, depth, retain, directory_budget)
+        except BudgetExceeded as exc:
+            if depth != 1: raise
+            result = self.frames[path][0]
+            result['partial'] = True
+            self.budget_exhausted.append(os.path.relpath(path, self.root))
+            # Only completed work is retained; do not extrapolate time-truncated samples.
+            if retain: self.record(path, result, True)
+            return result
+        finally:
+            if depth == 1:
+                self.budget = None
+                self.frames = {p:v for p,v in self.frames.items() if p == self.root}
+
+    def _walk(self, path, depth, retain, directory_budget):
         result = dict(values={m: (0., 0.) for m in METRICS}, errors=0, estimated=False,
-                      direct_files=0, direct_directories=0, sampled_files=0, sampled_directories=0)
+                      direct_files=0, direct_directories=0, sampled_files=0, sampled_directories=0, partial=False)
+        self.frames[path] = (result, retain)
+        self.tick()
         result['values']['directories'] = (1., 0.)
         rng = random.Random(hashlib.sha256(os.fsencode(path) + str(self.args.seed).encode()).digest())
         reservoirs = [[], []]  # files, directories
@@ -113,6 +155,14 @@ class Sampler:
             kf = min(nf, size - kd)
         else:
             kf, kd = min(nf, size), min(nd, size)
+        if directory_budget is not None and nd:
+            # Divide the budget before sampling, rather than multiplying it at each level.
+            kd = min(kd, max(1, (directory_budget - 1) // 8)) if directory_budget > 1 else 0
+            if kd == 0: result['partial'] = True
+        if self.budget:
+            remaining_stats = self.args.subtree_stats - (self.counters['file_stats'] - self.budget[0]['file_stats'])
+            kf = min(kf, remaining_stats)
+            if nf and not kf: result['partial'] = True
         selected = [rng.sample(reservoirs[0], kf), rng.sample(reservoirs[1], kd)]
         result.update(direct_files=nf, direct_directories=nd, sampled_files=kf, sampled_directories=kd,
                       estimated=kf < nf or kd < nd)
@@ -137,43 +187,51 @@ class Sampler:
             self.record(path, result, True)
         # Accumulate only sampled child totals: bounded by sample size below root.
         children = {m: [] for m in METRICS}
-        for child in sorted(selected[1]):
-            sub = self.walk(child, depth + 1, retain and kd == nd and depth < 2)
+        for index, child in enumerate(selected[1]):
+            child_budget = None if directory_budget is None else (directory_budget - 1) // kd + int(index < (directory_budget - 1) % kd)
+            sub = self.walk(child, depth + 1, retain and kd == nd and depth < 2, child_budget)
+            result['partial'] |= sub['partial']
             result['errors'] += sub['errors']
             result['estimated'] |= sub['estimated']
             for metric in METRICS:
                 children[metric].append(sub['values'][metric])
-                value, variance = expanded(children[metric], nd if depth else len(children[metric]))
+                # Missing selected siblings stay unknown, rather than inflating an early subset.
+                values = children[metric] + [(0., None)] * (kd - len(children[metric])) if depth else children[metric]
+                value, variance = expanded(values, nd if depth else len(children[metric]))
                 direct, direct_variance = base_values[metric]
                 result['values'][metric] = (direct + value, None if variance is None or direct_variance is None else variance + direct_variance)
+            if retain: self.record(path, result, True)
             if depth == 0:
                 self.root_result = result
                 self.record(path, result, True)
                 self.write()
                 print(json.dumps({'completed_top_level': os.path.basename(child), **self.counters}), flush=True)
         if retain: self.record(path, result, depth == 0 and not self.finished)
+        self.frames.pop(path, None)
         return result
 
     def record(self, path, result, partial=False):
         relative = os.path.relpath(path, self.root)
+        partial = partial or result.get('partial', False)
         entry = dict(path=relative, parent=None if relative == '.' else os.path.dirname(relative) or '.',
                      errors=result['errors'], complete=not partial and not result['estimated'] and not result['errors'],
                      estimated=result['estimated'], coverage_complete=not partial,
                      **{k: result[k] for k in ('direct_files','direct_directories','sampled_files','sampled_directories')})
         for metric, (value, variance) in result['values'].items():
             entry[metric] = round(value)
-            entry[metric + '_margin95'] = None if variance is None or result['errors'] else round(1.96 * math.sqrt(max(0., variance)))
+            entry[metric + '_margin95'] = None if variance is None or result['errors'] or partial else round(1.96 * math.sqrt(max(0., variance)))
+        if relative != '.' and entry['parent'] not in self.entries: return
         if len(self.entries) < 12000 or relative in self.entries: self.entries[relative] = entry
 
     def write(self, status=None):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         data = dict(cluster=self.args.cluster, root=self.root, filesystem=self.args.filesystem,
-                    method='approximate', complete=False, coverage_complete=self.finished,
-                    status=status or ('Approximate scan complete' if self.finished else 'Sampling — partial estimates'),
+                    method='approximate', complete=False, coverage_complete=self.finished and self.entries.get('.', {}).get('coverage_complete', False),
+                    status=status or ('Sampling pass finished — partial estimates' if self.finished and not self.entries.get('.', {}).get('coverage_complete', False) else 'Approximate scan complete' if self.finished else 'Sampling — partial estimates'),
                     started_at=datetime.datetime.fromtimestamp(self.started, datetime.timezone.utc).isoformat(),
                     updated_at=now, entries=sorted(self.entries.values(), key=lambda e: (e['path'] != '.', e['path'])),
                     sample_size=self.args.sample_size, seed=self.args.seed, counters=self.counters,
-                    error_samples=self.error_samples, truncated=True, max_depth=2,
+                    error_samples=self.error_samples, budget_exhausted=self.budget_exhausted, budget_limits=dict(directories=self.args.subtree_directories, file_stats=self.args.subtree_stats, entries=self.args.subtree_entries, seconds=self.args.subtree_seconds), truncated=True, max_depth=2,
                     uncertainty_note='Approximate 95% sampling margins, not guarantees. Rare large files may be missed; zero sample variation does not prove identical contents. File counts below unsampled folders are estimates. Symlinks and special files excluded.')
         output = Path(self.args.output)
         with open(str(output) + '.tmp', 'w') as f: json.dump(data, f)

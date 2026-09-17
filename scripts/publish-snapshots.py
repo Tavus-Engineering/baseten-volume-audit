@@ -13,6 +13,7 @@ p.add_argument('--directory',required=True)
 p.add_argument('--cluster',choices=['h100','h200'],required=True)
 p.add_argument('--filesystem',default='Unknown')
 p.add_argument('--config',required=True)
+p.add_argument('--interval',type=int,default=60)
 p.add_argument('--snapshot',help='Publish this existing JSON instead of exporting the exact database')
 p.add_argument('--finished-file',default='finished.json')
 p.add_argument('--final-marker',default='published-final.json')
@@ -36,4 +37,4 @@ while True:
             (base/args.final_marker).write_text(json.dumps({'updated_at':data['updated_at'],'complete':data['complete']}))
             break
     except Exception as exc:print('Publication retry:',type(exc).__name__,flush=True)
-    time.sleep(60)
+    time.sleep(max(5,args.interval))

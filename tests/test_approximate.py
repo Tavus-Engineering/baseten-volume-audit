@@ -73,4 +73,32 @@ class ApproximateTests(unittest.TestCase):
             self.assertEqual(d['files'],160)
             self.assertEqual(d['logical'],2400)
 
+    def test_directory_budget_moves_on_and_marks_unknown_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);root=base/'root';chain=root/'deep';chain.mkdir(parents=True)
+            for i in range(25):
+                chain=chain/'nested';chain.mkdir()
+            (chain/'file').write_bytes(b'large')
+            (root/'other').mkdir();(root/'other'/'file').write_bytes(b'ok')
+            data=self.run_scan(root,base/'estimate.json','--subtree-directories','10')
+            entries={e['path']:e for e in data['entries']}
+            self.assertLessEqual(data['counters']['directories_opened'],12)
+            self.assertEqual(entries['other']['logical'],2)
+            self.assertFalse(entries['deep']['coverage_complete'])
+            self.assertFalse(data['coverage_complete'])
+            self.assertIsNone(entries['.']['logical_margin95'])
+            self.assertTrue(all(e['parent'] is None or e['parent'] in entries for e in entries.values()))
+
+    def test_entry_budget_stops_large_listing_and_continues_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);root=base/'root';(root/'large').mkdir(parents=True)
+            for i in range(100):(root/'large'/str(i)).write_bytes(b'x')
+            (root/'small').mkdir();(root/'small'/'file').write_bytes(b'ok')
+            data=self.run_scan(root,base/'estimate.json','--subtree-entries','10')
+            entries={e['path']:e for e in data['entries']}
+            self.assertLessEqual(data['counters']['entries_listed'],13)
+            self.assertEqual(entries['small']['logical'],2)
+            self.assertFalse(data['coverage_complete'])
+            self.assertIn('large',data['budget_exhausted'])
+
 if __name__=='__main__':unittest.main()
