@@ -165,3 +165,17 @@ Names can usually be counted without a separate stat call when the filesystem su
 Approximate scans now have shared **per-top-level-subtree** limits: `--subtree-directories 1000`, `--subtree-stats 10000`, `--subtree-entries 250000`, and `--subtree-seconds 30`. Directory budgets are divided among selected children before traversal, avoiding exponential growth. Small folders may also be sampled when the remaining shared budget requires it. Limits do not interrupt a blocked filesystem syscall. Budget-truncated branches are explicitly incomplete with unknown uncertainty; they are never presented as full-volume estimates. The scanner moves on to other top-level folders and emits connected partial snapshots at most ten seconds apart between operations. An in-progress ancestor may not yet include its active child; those values are partial.
 
 The H100 host configuration allows eight hours. For long exact scans use a runner duration below the host lifetime (for example `--duration 25200` for seven hours), monitor actual progress, and checkpoint/resume again if necessary rather than treating the deadline as successful completion. Restoring a database on another machine still requires the same mounted volume/root identity. A resumed live scan combines observations from multiple times; it does not refresh previously completed directories.
+
+### Directory owner and timestamps
+
+Enrich an existing exported snapshot on a machine mounting the **same volume**:
+
+```sh
+python3 scripts/enrich-metadata.py --snapshot snapshot.json --output snapshot-with-metadata.json --expected-root-inode INODE
+```
+
+This probes only the published directories (default maximum 200 per second), never lists their contents, and preserves size totals and original scan timestamps. Verify the mount source/volume identity first; use the original scan's root inode as an additional guard. Publish the enriched JSON through the usual authenticated ingest endpoint. Run enrichment after each completed scan; a fresh export does not retain enrichment. It also accepts approximate snapshots without changing their method or coverage flags.
+
+Metadata has a separate observation time. UID/GID and local OS account names are not reliable teammate attribution (shared/root accounts are common). Linux creation time uses `statx` birth time where supported; otherwise it is null, never substituted with ctime. Directory mtime reflects changes to direct directory entries, not all descendants. Directory atime can be stale, disabled or changed by listing/scanning; it is **not last training use**. A later metadata probe cannot reconstruct access times from before an earlier scan. Reliable last-use attribution needs application/job instrumentation or a filesystem audit feed.
+
+Paths that disappeared, changed to symlinks, cross filesystems or cannot be accessed retain their inventory totals and receive an explicit metadata error. The probe refuses absolute/traversal paths and follows no directory symlinks. Live namespace changes can still occur during collection.
