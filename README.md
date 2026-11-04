@@ -179,3 +179,55 @@ This probes only the published directories (default maximum 200 per second), nev
 Metadata has a separate observation time. UID/GID and local OS account names are not reliable teammate attribution (shared/root accounts are common). Linux creation time uses `statx` birth time where supported; otherwise it is null, never substituted with ctime. Directory mtime reflects changes to direct directory entries, not all descendants. Directory atime can be stale, disabled or changed by listing/scanning; it is **not last training use**. A later metadata probe cannot reconstruct access times from before an earlier scan. Reliable last-use attribution needs application/job instrumentation or a filesystem audit feed.
 
 Paths that disappeared, changed to symlinks, cross filesystems or cannot be accessed retain their inventory totals and receive an explicit metadata error. The probe refuses absolute/traversal paths and follows no directory symlinks. Live namespace changes can still occur during collection.
+
+### 30-day cache TTL
+
+`cache_ttl.py` deletes **regular files** after 30 full days without a read or a
+content/metadata change. Empty directories, symlinks and filesystem trash are
+preserved. It reads live file metadata, never audit snapshots or directory atime.
+Dry-run is the default and output contains aggregate counts only.
+
+**Deployment prerequisite:** Baseten must confirm that every client of each
+volume records file reads with strict access times (including reads served from
+client/page caches and long-lived open files). Linux mount options alone do not
+prove this for a distributed filesystem. JuiceFS Community defaults to `noatime`;
+its [atime modes](https://juicefs.com/docs/community/command_reference/#juicefs-mount)
+are distinct from Enterprise/WEKA configuration. Confirm the actual backend per
+cluster. If reliable read tracking cannot be enabled, this tool must not be used
+for deletion; a platform last-read feed or instrumentation of every reader is
+needed instead. Do not substitute mtime, scan time or project age for last read.
+
+Record the UTC time when tracking was verified on **all** clients. Keep that time
+fixed across scheduled runs; a new client that does not track reads invalidates
+the attestation. The cleaner enforces a 30-day warm-up after that point because
+existing timestamps cannot establish historical reads.
+
+Run on a Linux cache-enabled maintenance host for each cluster/team/project
+cache. Baseten [scopes caches to a GPU cluster](https://docs.baseten.co/training/concepts/cache),
+so an H100 pass does not clean an H200 or RTX cache. Use the exact mounted cache
+path and verify volume identity with `scripts/preflight.sh` first. This script
+does not provision or keep GPU jobs alive.
+
+```sh
+# Example timestamp: replace with the actual verified tracking start.
+python3 cache_ttl.py /root/.cache/team_artifacts \
+  --strict-read-tracking-since 2026-11-04T00:00:00Z
+```
+
+After the warm-up, invoke the same command with `--apply --readers-quiesced`
+from the cluster's daily maintenance procedure, **after all clients pause reads
+and writes and pending metadata updates have flushed**, then resume jobs when
+it finishes. Do not put that confirmation flag in an unattended cron job unless
+its wrapper actually establishes that maintenance window. This repository does
+not currently own a Baseten maintenance scheduler; wiring the command into one
+and enabling strict tracking remain deployment steps. No live deletion is
+enabled by adding this script.
+
+The second stat before unlink protects candidates that changed during traversal,
+but POSIX cannot atomically compare last-read time and unlink. Pausing clients
+is necessary to close that final race. The script follows no directory symlinks,
+stays on the root device, skips `.trash` and `.jfs`, and never recursively removes
+a directory. Avoid nested bind mounts on the same device inside the cache.
+Filesystem trash may delay physical space reclamation; TTL removes the live
+namespace entry and does not bypass the backend's recovery retention. Exit 1
+means some paths could not be processed; retry after resolving access errors.
